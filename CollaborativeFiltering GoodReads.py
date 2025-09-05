@@ -1,201 +1,167 @@
-import pandas as pd
+import os
 import numpy as np
-from surprise import Dataset, Reader, SVD
-from surprise.model_selection import train_test_split
-from surprise import accuracy
+import pandas as pd
+from surprise import Dataset, Reader, SVD, accuracy
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# Učitaj podatke
-books = pd.read_csv('GoodReads/books.csv')
-ratings = pd.read_csv('GoodReads/ratings.csv')
+DATA_DIR = "GoodReads"
+TRAIN_CSV = os.path.join(DATA_DIR, "train_df.csv")
+TEST_CSV = os.path.join(DATA_DIR, "test_df.csv")
+BOOKS_SUBSET_CSV = os.path.join(DATA_DIR, "books_subset.csv")
+OUT_PLOTS = "plots"
+os.makedirs(OUT_PLOTS, exist_ok=True)
 
-# Priprema podataka kao u ContentFiltering GoodReads
-ratings_rmv_duplicates = ratings.drop_duplicates()
-unwanted_users = ratings_rmv_duplicates.groupby('user_id')['user_id'].count()
-unwanted_users = unwanted_users[unwanted_users < 3]
-unwanted_ratings = ratings_rmv_duplicates[ratings_rmv_duplicates.user_id.isin(unwanted_users.index)]
-new_ratings = ratings_rmv_duplicates.drop(unwanted_ratings.index)
+# Učitaj split i metapodatke
+train_df = pd.read_csv(TRAIN_CSV)
+test_df = pd.read_csv(TEST_CSV)
+books = pd.read_csv(BOOKS_SUBSET_CSV)
 
-# Smanji skup radi brže analize
-max_books = 5000
-books_small = books.iloc[:max_books].copy()
-book_ids_small = set(books_small['id'])
-ratings_small = new_ratings[new_ratings['book_id'].isin(book_ids_small)].copy()
+print(f"Loaded: train {len(train_df)} rows, test {len(test_df)} rows, books {len(books)}")
 
-# Surprise priprema
-reader = Reader(rating_scale=(1, 5))
-data = Dataset.load_from_df(ratings_small[['user_id', 'book_id', 'rating']], reader)
-trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
+# tipovi i sanity
+train_df['user_id'] = train_df['user_id'].astype(int)
+train_df['book_id'] = train_df['book_id'].astype(int)
+test_df['user_id'] = test_df['user_id'].astype(int)
+test_df['book_id'] = test_df['book_id'].astype(int)
+if 'rating' in train_df.columns:
+    train_df['rating'] = pd.to_numeric(train_df['rating'], errors='coerce')
+if 'rating' in test_df.columns:
+    test_df['rating'] = pd.to_numeric(test_df['rating'], errors='coerce')
 
-# SVD model
+# nakon učitavanja train_df/test_df/books
+# osiguraj tipove (postoje u datoteci) i očisti duplicate u train/test ako je potrebno
+train_df = train_df.drop_duplicates(subset=['user_id','book_id']).reset_index(drop=True)
+test_df = test_df.drop_duplicates(subset=['user_id','book_id']).reset_index(drop=True)
+
+# Surprise trening (kao prije)
+reader = Reader(rating_scale=(train_df['rating'].min(), train_df['rating'].max()))
+data = Dataset.load_from_df(train_df[['user_id', 'book_id', 'rating']], reader)
+trainset = data.build_full_trainset()
+
 svd = SVD(n_factors=50, random_state=42)
 svd.fit(trainset)
-predictions = svd.test(testset)
 
-# Evaluacija
-mae = accuracy.mae(predictions, verbose=False)
-rmse = accuracy.rmse(predictions, verbose=False)
-print(f"MAE: {mae:.4f}")
-print(f"RMSE: {rmse:.4f}")
+# candidate pool: koristi popular + sve test items (union) da ne izgubiš relevantne stavke
+test_items = set(test_df['book_id'].astype(int).unique())
+valid_books = set(books['id'].astype(int).tolist())
+pop_counts = train_df['book_id'].value_counts()
+popular = pop_counts[pop_counts >= 5].index.tolist()
+min_pool = 1000
+if len(popular) < min_pool:
+    popular = pop_counts.index[:min_pool].tolist()
+candidate_book_ids = sorted(set(popular) & valid_books | test_items)
+print(f"Candidate pool size: {len(candidate_book_ids)}; test items covered: {len(test_items & set(candidate_book_ids))}/{len(test_items)}")
 
-# Precision@N i MAP
-def get_top_n(predictions, n=10):
-    top_n = {}
-    for uid, iid, true_r, est, _ in predictions:
-        top_n.setdefault(uid, [])
-        top_n[uid].append((iid, est))
-    for uid, user_ratings in top_n.items():
-        user_ratings.sort(key=lambda x: x[1], reverse=True)
-        top_n[uid] = [iid for (iid, _) in user_ratings[:n]]
-    return top_n
+# odabir korisnika za evaluaciju (slično kao u ContentFiltering)
+def select_eval_users(train_df, test_df, candidate_book_ids, min_train_items=3, max_users=10000, seed=42):
+    cand_set = set(candidate_book_ids)
+    users = sorted(test_df['user_id'].unique())
+    eligible = []
+    for uid in users:
+        train_items = set(train_df[train_df['user_id'] == uid]['book_id'].astype(int).tolist())
+        test_items = set(test_df[test_df['user_id'] == uid]['book_id'].astype(int).tolist())
+        # require min history and at least one test item covered in candidate pool
+        if len(train_items) >= min_train_items and len(test_items & cand_set) > 0:
+            eligible.append(uid)
+    rng = np.random.RandomState(seed)
+    if len(eligible) > max_users:
+        eligible = list(rng.choice(eligible, size=max_users, replace=False))
+    return sorted(eligible)
 
+# <-- CHANGED: ensure users have >=1 train item and >=1 test item; limit to at most 200 users -->
+min_train_items = 1
+max_eval_users = 1000
+eval_users = select_eval_users(train_df, test_df, candidate_book_ids,
+                               min_train_items=min_train_items, max_users=max_eval_users, seed=42)
+print(f"Evaluating on {len(eval_users)} users (min_train_items={min_train_items}, max={max_eval_users}).")
+
+# Evaluacija na podskupu korisnika (MAE, RMSE)
+test_subset_df = test_df[test_df['user_id'].isin(eval_users)].reset_index(drop=True)
+test_tuples_subset = list(zip(test_subset_df['user_id'].astype(str),
+                              test_subset_df['book_id'].astype(str),
+                              test_subset_df['rating'].astype(float)))
+preds_subset = svd.test(test_tuples_subset)
+mae_subset = accuracy.mae(preds_subset, verbose=False)
+rmse_subset = accuracy.rmse(preds_subset, verbose=False)
+
+# Top-N preporuke i evaluacija (Precision, Recall, MAP)
 N = 10
-max_users = 1000
+total_tp = total_pred = total_rel = 0
+per_user_prec = []
+per_user_rec = []
+per_user_ap = []
 
-top_n = get_top_n(predictions, n=N)
-precisions = []
-aps = []
-user_count = 0
-for uid, user_ratings in top_n.items():
-    if user_count >= max_users:
-        break
-    user_count += 1
-    relevant = set(ratings_small[ratings_small['user_id'] == uid]['book_id'])
-    pred = set(user_ratings)
-    true_positives = len(relevant & pred)
-    precision = true_positives / N if N > 0 else 0
-    precisions.append(precision)
-    hits = 0
-    sum_precisions = 0
-    for i, rec in enumerate(user_ratings):
-        if rec in relevant:
+cand_set = set(candidate_book_ids)
+for uid in eval_users:
+    relevant = set(test_df[test_df['user_id'] == uid]['book_id'].astype(int).tolist())
+    seen = set(train_df[train_df['user_id'] == uid]['book_id'].astype(int).tolist())
+    # restrict candidates to pool and exclude seen
+    candidates = [b for b in candidate_book_ids if b not in seen]
+    if not candidates:
+        continue
+    # score candidates (may be slow; consider parallelizing)
+    scores = [(b, svd.predict(str(uid), str(b)).est) for b in candidates]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    topn = [b for b,_ in scores[:N]]
+    tp = len(set(topn) & relevant)
+    per_user_prec.append(tp / N)
+    per_user_rec.append(tp / len(relevant) if len(relevant)>0 else 0.0)
+    # AP@N
+    hits = 0; sum_prec = 0.0
+    for i,b in enumerate(topn):
+        if b in relevant:
             hits += 1
-            sum_precisions += hits / (i + 1)
-    ap = sum_precisions / min(len(relevant), N) if relevant else 0
-    aps.append(ap)
+            sum_prec += hits / (i + 1)
+    per_user_ap.append(sum_prec / min(len(relevant), N) if len(relevant)>0 else 0.0)
+    total_tp += tp
+    total_pred += len(topn)
+    total_rel += len(relevant)
 
-if precisions:
-    print(f"Prosjecni Precision@{N}: {np.mean(precisions):.4f}")
-else:
-    print("Nema dovoljno podataka za Precision@N.")
+precision_macro = float(np.mean(per_user_prec)) if per_user_prec else np.nan
+recall_macro = float(np.mean(per_user_rec)) if per_user_rec else np.nan
+map_macro = float(np.mean(per_user_ap)) if per_user_ap else np.nan
+precision_micro = total_tp / total_pred if total_pred>0 else np.nan
+recall_micro = total_tp / total_rel if total_rel>0 else np.nan
 
-if aps:
-    print(f"Prosjecni MAP@{N}: {np.mean(aps):.4f}")
-else:
-    print("Nema dovoljno podataka za MAP.")
+print("\nSubset evaluation (selected users):")
+print(f" MAE={mae_subset:.4f}, RMSE={rmse_subset:.4f}")
+print(f" Precision@{N} macro={precision_macro:.6f}, micro={precision_micro:.6f}")
+print(f" Recall@{N}    macro={recall_macro:.6f}, micro={recall_micro:.6f}")
+print(f" MAP@{N} (macro)={map_macro:.6f}")
 
+# --- Quick baselines and item-kNN experiment (evaluate on same eval_users) ---
+from surprise import KNNBasic
 
-# Grafički prikaz Precision@N i MAP za različite N (samo za prvih 1000 korisnika)
-N_range = range(1, 16)
-precision_at_n = []
-map_at_n = []
-for test_N in N_range:
-    top_n = get_top_n(predictions, n=test_N)
-    precisions = []
-    aps = []
-    user_count = 0
-    for uid, user_ratings in top_n.items():
-        if user_count >= max_users:
-            break
-        user_count += 1
-        relevant = set(ratings_small[ratings_small['user_id'] == uid]['book_id'])
-        pred = set(user_ratings)
-        true_positives = len(relevant & pred)
-        precision = true_positives / test_N if test_N > 0 else 0
-        precisions.append(precision)
-        hits = 0
-        sum_precisions = 0
-        for i, rec in enumerate(user_ratings):
-            if rec in relevant:
+def evaluate_ranklist_for_users(get_top_n_for_user, users_list):
+    N = 10
+    total_tp = total_pred = total_rel = 0
+    per_prec = []; per_rec = []; per_ap = []
+    for uid in users_list:
+        relevant = set(test_df[test_df['user_id'] == uid]['book_id'].astype(int).tolist())
+        if not relevant:
+            continue
+        seen = set(train_df[train_df['user_id'] == uid]['book_id'].astype(int).tolist())
+        recs = get_top_n_for_user(uid, seen, N)
+        if not recs:
+            continue
+        tp = len(set(recs) & relevant)
+        per_prec.append(tp / N)
+        per_rec.append(tp / len(relevant))
+        # AP@N
+        hits = 0; sum_prec = 0.0
+        for i, b in enumerate(recs):
+            if b in relevant:
                 hits += 1
-                sum_precisions += hits / (i + 1)
-        ap = sum_precisions / min(len(relevant), test_N) if relevant else 0
-        aps.append(ap)
-    precision_at_n.append(np.mean(precisions) if precisions else 0)
-    map_at_n.append(np.mean(aps) if aps else 0)
-
-plt.figure(figsize=(10,5))
-plt.plot(list(N_range), np.round(precision_at_n, 4), marker='o', label='Precision@N')
-plt.plot(list(N_range), np.round(map_at_n, 4), marker='o', label='MAP@N')
-plt.xlabel('N')
-plt.ylabel('Vrijednost metrike')
-plt.title('Precision@N i MAP@N za razlicite vrijednosti N (GoodReads SVD, prvih 1000 korisnika)')
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
-
-# Evaluacija za više brojeva korisnika
-user_counts_to_test = [500, 1000, 2000, 4000, 6000]
-results = []
-
-for max_users in user_counts_to_test:
-    precisions = []
-    aps = []
-    all_true = []
-    all_pred = []
-    user_count = 0
-    top_n = get_top_n(predictions, n=N)
-    for uid, user_ratings in top_n.items():
-        if user_count >= max_users:
-            break
-        user_count += 1
-        relevant = set(ratings_small[ratings_small['user_id'] == uid]['book_id'])
-        pred = set(user_ratings)
-        true_positives = len(relevant & pred)
-        precision = true_positives / N if N > 0 else 0
-        precisions.append(precision)
-        hits = 0
-        sum_precisions = 0
-        for i, rec in enumerate(user_ratings):
-            if rec in relevant:
-                hits += 1
-                sum_precisions += hits / (i + 1)
-        ap = sum_precisions / min(len(relevant), N) if relevant else 0
-        aps.append(ap)
-        # MAE/RMSE: predviđene ocjene su est iz SVD predikcije
-        for rec in user_ratings:
-            true_rating = ratings_small[(ratings_small['user_id'] == uid) & (ratings_small['book_id'] == rec)]['rating']
-            if not true_rating.empty:
-                # user_ratings je lista book_id, pronađi est iz predictions
-                est_rating = next((est for u, b, _, est, _ in predictions if u == uid and b == rec), None)
-                if est_rating is not None:
-                    all_true.append(true_rating.values[0])
-                    all_pred.append(est_rating)
-    mae = mean_absolute_error(all_true, all_pred) if all_true and all_pred else None
-    rmse = np.sqrt(mean_squared_error(all_true, all_pred)) if all_true and all_pred else None
-    precision_val = np.mean(precisions) if precisions else None
-    map_val = np.mean(aps) if aps else None
-    results.append({
-        'users': max_users,
-        'MAE': mae,
-        'RMSE': rmse,
-        'Precision@N': precision_val,
-        'MAP': map_val
-    })
-    mae_str = f"{mae:.4f}" if mae is not None else "None"
-    rmse_str = f"{rmse:.4f}" if rmse is not None else "None"
-    precision_str = f"{precision_val:.4f}" if precision_val is not None else "None"
-    map_str = f"{map_val:.4f}" if map_val is not None else "None"
-    print(f"Evaluacija za {max_users} korisnika: MAE={mae_str}, RMSE={rmse_str}, Precision@{N}={precision_str}, MAP={map_str}")
-
-# Grafički prikaz
-users = [r['users'] for r in results]
-mae_vals = [r['MAE'] if r['MAE'] is not None else np.nan for r in results]
-rmse_vals = [r['RMSE'] if r['RMSE'] is not None else np.nan for r in results]
-precision_vals = [r['Precision@N'] if r['Precision@N'] is not None else np.nan for r in results]
-map_vals = [r['MAP'] if r['MAP'] is not None else np.nan for r in results]
-
-plt.figure(figsize=(10,5))
-plt.plot(users, np.round(mae_vals, 4), marker='o', label='MAE')
-plt.plot(users, np.round(rmse_vals, 4), marker='o', label='RMSE')
-plt.plot(users, np.round(precision_vals, 4), marker='o', label=f'Precision@{N}')
-plt.plot(users, np.round(map_vals, 4), marker='o', label='MAP')
-plt.xlabel('Broj korisnika')
-plt.ylabel('Vrijednost metrike')
-plt.title('Evaluacija sustava za različit broj korisnika (Collaborative GoodReads)')
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+                sum_prec += hits / (i + 1)
+        per_ap.append(sum_prec / min(len(relevant), N) if len(relevant) > 0 else 0.0)
+        total_tp += tp
+        total_pred += len(recs)
+        total_rel += len(relevant)
+    return {
+        "precision_macro": float(np.mean(per_prec)) if per_prec else np.nan,
+        "recall_macro": float(np.mean(per_rec)) if per_rec else np.nan,
+        "map_macro": float(np.mean(per_ap)) if per_ap else np.nan,
+        "precision_micro": total_tp / total_pred if total_pred > 0 else np.nan,
+        "recall_micro": total_tp / total_rel if total_rel > 0 else np.nan,
+        "users": len(per_prec)
+    }
